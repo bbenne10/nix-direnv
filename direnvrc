@@ -8,6 +8,10 @@ _nix_direnv_preflight () {
     exit 1
   fi
 
+  if ! has comm; then
+    printf '%s\n' "nix-direnv: missing comm utility; have you installed GNU coreutils?"
+    exit 1
+  fi
 
   if [[ -z ${NIX_BIN_PREFIX:-} ]]; then
     NIX_BIN_PREFIX=$(command -v nix-shell)
@@ -31,8 +35,6 @@ _nix_direnv_preflight () {
   if [[ ! -d "$layout_dir" ]]; then
     mkdir -p "$layout_dir"
   fi
-
-
 }
 
 # Usage: nix_direnv_version <version_at_least>
@@ -83,6 +85,32 @@ _nix_export_or_unset() {
   else
     export "$key=$value"
   fi
+}
+
+# Usage: _nix_direnv_need_update <profile_rc path> <...watches>
+#
+# Checks for files in $watches that are newer than the mtime of $profile_rc
+# Returns 0 if no update is needed; 1 otherwise
+_nix_direnv_need_update() {
+  local profile_rc
+  profile_rc=$(_nix_direnv_realpath "$1")
+  shift
+  local watches="$@"
+
+  local files_newer_than_profile_rc
+  mapfile -t files_newer_than_profile_rc < <(find "$PWD" -newer "$profile_rc")
+
+  local nix_files
+  mapfile -t nix_files < <(find "$PWD" -name "*.nix")
+
+  watches+=("${nix_files[@]}")
+  local sorted_watches
+  mapfile -t sorted_watches < <(sort <<<"${watches[*]}" | uniq)
+  local sorted_newer
+  mapfile -t sorted_newer < <(sort <<<"${files_newer_than_profile_rc[*]}" | uniq)
+
+  num_newer=$(comm -12 <(printf "%s\n" "${sorted_watches[@]}") <(printf "%s\n" "${sorted_newer[@]}") | wc -l)
+  [[ $num_newer -eq 0 ]] && return 0 || return 1
 }
 
 _nix_import_env() {
@@ -141,8 +169,15 @@ _nix_argsum_suffix() {
 }
 
 nix_direnv_watch_file() {
-  watch_file "$@"
-  nix_watches+=("$@")
+  local watches
+  for watch in "${@}"; do
+    local watch_fp
+    watch_fp=$(_nix_direnv_realpath "$watch")
+    watches+=("$watch_fp")
+  done
+
+  watch_file "${watches[@]}"
+  nix_watches+=("${watches[@]}")
 }
 
 use_flake() {
@@ -166,18 +201,12 @@ use_flake() {
   local profile_rc="${profile}.rc"
   local flake_inputs="${layout_dir}/flake-inputs/"
 
-  local need_update=0
-  local file=
-  for file in "${nix_watches[@]}"; do
-    if [[ "$file" -nt "$profile_rc" ]]; then
-      need_update=1
-      break
-    fi
-  done
+  local need_update
+  need_update=$(_nix_direnv_need_update "$profile_rc" "${nix_watches[@]}")
 
   if [[ ! -e "$profile"
      || ! -e "$profile_rc"
-     || "$need_update" == "1"
+     || "$need_update" -eq 1
      ]];
   then
     # We need to update our cache
@@ -308,18 +337,16 @@ use_nix() {
   # but nix_direnv_watch_file checks for existence before adding to watches
   nix_direnv_watch_file "$HOME/.direnvrc" "$HOME/.config/direnv/direnvrc" .envrc "$nixfile"
 
+  local files_newer_than_profile_rc
+  readarray -t files_newer_than_profile_rc < <(find . -newer "$profile_rc")
+
   local need_update=0
-  local file=
-  for file in "${nix_watches[@]}"; do
-    if [[ "$file" -nt "$profile_rc" ]]; then
-      need_update=1
-      break
-    fi
-  done
+  local need_update
+  need_update=$(_nix_direnv_need_update "$profile_rc" "${nix_watches[@]}")
 
   if [[ ! -e "$profile"
      || ! -e "$profile_rc"
-     || "$need_update" -eq "1"
+     || "$need_update" -gt 0
      ]];
   then
     local tmp_profile="${layout_dir}/flake-profile.$$"
